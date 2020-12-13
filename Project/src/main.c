@@ -92,7 +92,7 @@ static void passkey_display(struct bt_conn *conn, unsigned int passkey)
 	snprintk(buf, sizeof(buf), "Passkey:\n%06u", passkey);
 
 	printk("%s\n", buf);
-	board_show_text(buf, false, K_FOREVER);
+	board_show_text(buf, false, K_SECONDS(20));
 }
 
 static void passkey_cancel(struct bt_conn *conn)
