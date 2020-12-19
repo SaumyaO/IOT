@@ -523,7 +523,7 @@ void mesh_send_baduser(void)
 {	
 	k_work_submit(&baduser_work);
 }
-
+/* Self provsioning */
 static int provision_and_configure(void)
 {	
 	static const uint8_t net_key[16] = {
