@@ -343,12 +343,13 @@ static void vnd_hello(struct bt_mesh_model *model,
 	board_add_hello(ctx->addr,ctx->recv_rssi, str);
 	
 	strcat(str, " says hi!");
-
 	
 	board_show_text(str, false, K_SECONDS(1));
-
+	
 	board_blink_leds();
 }
+
+/* Model for publishing the data*/
 
 static void vnd_distance(struct bt_mesh_model *model,
 		      struct bt_mesh_msg_ctx *ctx,
@@ -368,8 +369,7 @@ static void vnd_distance(struct bt_mesh_model *model,
 	str[len] = '\0';
 	board_add_hello(ctx->addr, ctx->recv_rssi,str);
 	sprintf(str,"0x%x", ctx->addr);
-	board_blink_leds();
-			
+	board_blink_leds();	
 }
 
 static void vnd_baduser(struct bt_mesh_model *model,
