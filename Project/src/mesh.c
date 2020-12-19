@@ -591,6 +591,7 @@ static int provision_and_configure(void)
 	bt_mesh_cfg_mod_pub_set_vnd(NET_IDX, addr, addr, MOD_LF, BT_COMP_ID_LF,
 				    &pub, NULL);
 
+	printk("Check whether the information store data is presistently is recieved if not the node is not configured for message passing\n");
 	printk("Configuration complete\n");
 
 	return addr;
