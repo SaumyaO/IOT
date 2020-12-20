@@ -13,7 +13,7 @@
 #include <drivers/flash.h>
 #include <storage/flash_map.h>
 #include <drivers/sensor.h>
-#include<math.h>
+#include <math.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -23,6 +23,10 @@
 #include "mesh.h"
 #include "board.h"
 #include "getled.h"
+
+#if CONFIG_NET_IPV4
+#include "http_util.h"
+#endif
 
 enum font_size {
 	FONT_SMALL = 0,
@@ -77,7 +81,6 @@ static struct {
 
 struct k_delayed_work led_timer;
 int show_sensors_data(k_timeout_t interval);
-void post_sensor_data( char * data);
 
 static size_t print_line(enum font_size font_size, int row, const char *text,
 			 size_t len, bool center)
@@ -293,19 +296,16 @@ float_t distance(int8_t rssi)
 	p = (pow(10,temp)*100); 
 	return p;
 }
+
 void Display(k_timeout_t interval)
 {	
-	
 	int i;
 	struct stat *stat;
 	char str[100], str1[32];
 	
-	
 	/* Get the Board Address */
 	struct sensor_value val[3];
 	sprintf(str,"0x%04x", mesh_get_addr());
-	
-	
 	
 	/* hdc1010 get Temperature and Humidity */
 	if (get_hdc1010_val(val)) {
@@ -327,9 +327,10 @@ void Display(k_timeout_t interval)
 	
 	/* Get the Information of the neighbour node : Address, Disance */
 	if (stat_count > 0) {
-		
-		for (i = 0; i < ARRAY_SIZE(stats); i++) {
-		
+		printk("stats cound: %d\n", stat_count);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(stats); i++) {
 		stat = &stats[i];
 		if (!stat->addr) {
 			break;
@@ -348,23 +349,19 @@ void Display(k_timeout_t interval)
 			
 		sprintf(str1,",%ld", stat->d/100);
 		strcat(str, str1);
-			
-			
-		}
 	}
 
-	
 	k_delayed_work_submit(&epd_work, interval);
-	post_sensor_data(str);					// Calling Function post_sensor_data
+
+#if CONFIG_NET_IPV4
+	post_sensor_data(str);
 	return;
+#else
+	printk("I am skipping HTTP post\n");
+#endif
+
 _error_get:
 	printk("Failed to get sensor data or print a string\n");
-}
-
-void post_sensor_data( char * data)
-{
- printk("Posting Data : %s\n", data);
-
 }
 
 /* To display the statistic on the Board */

@@ -322,7 +322,6 @@ static struct bt_mesh_model root_models[] = {
 		      sensor_srv_op, NULL, NULL),
 };
 
-
 static void vnd_hello(struct bt_mesh_model *model,
 		      struct bt_mesh_msg_ctx *ctx,
 		      struct net_buf_simple *buf)

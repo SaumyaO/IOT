@@ -6,7 +6,7 @@ Steps to set up on Linux system an Andriod Phone:
 
 #. Go to the zephyr folder where the project is downloaded : cd ~/zephyrproject/zephyr
 
-#. To Compile: west build -b reel_board_v2 Project
+#. To Compile: west build -b reel_board_v2 Project  -- -DSHIELD=link_board_eth
 
 #. To execute : west flash
 
