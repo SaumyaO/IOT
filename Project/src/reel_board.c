@@ -353,12 +353,12 @@ void Display(k_timeout_t interval)
 
 	k_delayed_work_submit(&epd_work, interval);
 
-#if CONFIG_NET_IPV4
-	post_sensor_data(str);
+	char *payload = k_malloc(100);
+	char *values = "\"%s\"";
+	sprintf(payload, values, str);
+	post_sensor_data(payload);
+	k_free(payload);
 	return;
-#else
-	printk("I am skipping HTTP post\n");
-#endif
 
 _error_get:
 	printk("Failed to get sensor data or print a string\n");
