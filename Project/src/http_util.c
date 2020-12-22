@@ -9,8 +9,21 @@
 
 #include "http_util.h"
 
+#define HTTP_PORT 8000
+#define HTTP_PROTOCOL "HTTP/1.2"
+
+#define MAX_RECV_BUF_LEN 512
+#define REMOTE_SERVER_ADDRESS  "192.168.10.10"
+
 
 static uint8_t recv_buf_ipv4[MAX_RECV_BUF_LEN];
+
+char *http_headers[] = {
+    "Content-Length: 30\r\n",
+    "Content-Type: application/json\r\n",
+    "Authorization: Token 439c3b239670205ec60a0510cabdab6d220da5c2\r\n",
+    NULL
+};
 
 void error(const char *msg) {
     printk("%s\n", msg);
@@ -27,10 +40,10 @@ static int setup_socket(sa_family_t family, const char *server, int port, int *s
     return 0;
 }
 
-// static int payload_callback(int sock, struct http_request *req, void *user_data) {
-//     (void)send(sock, user_data, strlen(user_data), 0);
-//     return 0;
-// }
+static int payload_callback(int sock, struct http_request *req, void *user_data) {
+    (void)send(sock, user_data, strlen(user_data), 0);
+    return 0;
+}
 
 static void response_callback(struct http_response *resp, enum http_final_call final_data, void *user_data){
     if (final_data == HTTP_DATA_MORE) {
@@ -39,7 +52,7 @@ static void response_callback(struct http_response *resp, enum http_final_call f
         printk("All data has been received (%zd bytes), status: %s\n", resp->data_len, resp->http_status);
     }
 
-    printk("Response to %s", (const char *)user_data);
+    printk("Response to %s\n", (const char *)user_data);
 }
 
 static int connect_socket(sa_family_t family, const char *server, int port, int *sock, struct sockaddr *addr, socklen_t addr_len){
@@ -75,7 +88,7 @@ int ping_http_server() {
     memset(&req, 0, sizeof(req));
 
     req.method = HTTP_GET;
-    req.url = "/ping";
+    req.url = "/ping/";
     req.host = REMOTE_SERVER_ADDRESS;
     req.protocol = HTTP_PROTOCOL;
     req.response = response_callback;
@@ -94,9 +107,9 @@ int post_sensor_data(char *data) {
     int32_t timeout = 3 * MSEC_PER_SEC;
     int ret;
     int port = HTTP_PORT;
-
+    printk("before socket connect\n");
     connect_socket(AF_INET, REMOTE_SERVER_ADDRESS, port, &sock4, (struct sockaddr *)&addr4, sizeof(addr4));
-
+    printk("after socket connect\n");
     if(sock4 < 0) {
         printk("cannot create HTTP connection\n");
         return -1;
@@ -104,12 +117,14 @@ int post_sensor_data(char *data) {
 
     struct http_request req;
     memset(&req, 0, sizeof(req));
+    printk("before first memset call\n");
 
     struct http_request request;
     memset(&request, 0, sizeof(request));
+    printk("after second memset call\n");
 
     request.method = HTTP_POST;
-    request.url = "/api/remote/upload";
+    request.url = "/api/remote/upload/";
     request.host = REMOTE_SERVER_ADDRESS;
     request.protocol = HTTP_PROTOCOL;
     request.payload = data;
@@ -119,8 +134,16 @@ int post_sensor_data(char *data) {
     request.recv_buf_len = sizeof(recv_buf_ipv4);
     request.content_type_value = "application/json";
 
-    ret = http_client_req(sock4, &request, timeout, "IPv4 POST");
+    printk("after setting request stuff\n");
 
+    char content_length[30];
+    sprintf(content_length, "Content-Length: %d\r\n", strlen(data));
+    printk("setting content length\n");
+    http_headers[0] = content_length;
+    request.header_fields = http_headers;
+    printk("after setting request header fields\n");
+    ret = http_client_req(sock4, &request, timeout, "IPv4 POST");
+    printk("after http client request\n");
     close(sock4);
 
     return ret;
