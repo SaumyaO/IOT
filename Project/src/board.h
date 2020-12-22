@@ -25,4 +25,6 @@ int get_apds9960_val(struct sensor_value *val);
 int set_led_state(uint8_t id, bool state);
 int periphs_init(void);
 int board_init(void);
+void Display(k_timeout_t interval);
+
 
