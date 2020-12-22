@@ -43,5 +43,5 @@ To reset a board to its initial state (disable mesh, erase the stored text, and 
 
 #. Keep the user button pressed when powering on (or press the reset button when powered)
 #. Wait until "Reseting Device" is shown
- or 
+or 
 #. execute the code: $ pyocd erase -c chip -t nrf52 on the terminal
