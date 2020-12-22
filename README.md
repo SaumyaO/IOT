@@ -7,7 +7,7 @@ It is zephyr project.
 If the vendor function is not called update the KConf file under subsys/bluetooth/mesh.
 
 The above project works on:
-Zephyr_2.4.0
+Zephyr_2.4.99
 zephyr_sdk_0.11.3
 
 
