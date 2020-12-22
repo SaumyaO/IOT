@@ -1,6 +1,6 @@
 # IOT
 
-This is a project on Distributed Social Distance Alert System.
+This is a project on Decentralized Social Distance Alert and Monitoring System.
 
 It is zephyr project.
 
