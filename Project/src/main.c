@@ -1,219 +1,753 @@
 /*
+ * Copyright (c) 2018 Phytec Messtechnik GmbH
  * Copyright (c) 2018 Intel Corporation
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <zephyr.h>
+#include <device.h>
+#include <drivers/gpio.h>
+#include <display/cfb.h>
 #include <sys/printk.h>
-
+#include <drivers/flash.h>
+#include <storage/flash_map.h>
+#include <drivers/sensor.h>
+#include<math.h>
 #include <string.h>
-
-#include <settings/settings.h>
+#include <stdio.h>
 
 #include <bluetooth/bluetooth.h>
-#include <bluetooth/gatt.h>
-#include <drivers/sensor.h>
+#include <bluetooth/mesh/access.h>
 
 #include "mesh.h"
 #include "board.h"
-#include "dhcp_config.h"
+#include "getled.h"
 
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
+enum font_size {
+	FONT_SMALL = 0,
+	FONT_MEDIUM = 1,
+	FONT_BIG = 2,
 };
 
-static ssize_t read_name(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-			 void *buf, uint16_t len, uint16_t offset)
-{
-	const char *value = bt_get_name();
+enum screen_ids {
+	SCREEN_MAIN = 0,
+	SCREEN_STATS = 1,
+	SCREEN_DIS = 2,
+	SCREEN_LAST,
+};
 
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, value,
-				 strlen(value));
-}
+struct font_info {
+	uint8_t columns;
+} fonts[] = {
+	[FONT_BIG] =    { .columns = 12 },
+	[FONT_MEDIUM] = { .columns = 16 },
+	[FONT_SMALL] =  { .columns = 25 },
+};
 
-static ssize_t write_name(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-			  const void *buf, uint16_t len, uint16_t offset,
-			  uint8_t flags)
-{
-	char name[CONFIG_BT_DEVICE_NAME_MAX];
-	int err;
+#define LONG_PRESS_TIMEOUT K_SECONDS(1)
 
-	if (offset) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+#define STAT_COUNT 128
+
+static const struct device *epd_dev;
+static bool pressed;
+static uint8_t screen_id = SCREEN_MAIN;
+static const struct device *gpio;
+static struct k_delayed_work epd_work;
+static struct k_delayed_work long_press_work;
+static char str_buf[256];
+
+static int status;
+static struct {
+	const struct device *dev;
+	const char *name;
+	gpio_pin_t pin;
+	gpio_flags_t flags;
+} leds[] = {
+	{ .name = DT_GPIO_LABEL(DT_ALIAS(led0), gpios),
+	  .pin = DT_GPIO_PIN(DT_ALIAS(led0), gpios),
+	  .flags = DT_GPIO_FLAGS(DT_ALIAS(led0), gpios)},
+	{ .name = DT_GPIO_LABEL(DT_ALIAS(led1), gpios),
+	  .pin = DT_GPIO_PIN(DT_ALIAS(led1), gpios),
+	  .flags = DT_GPIO_FLAGS(DT_ALIAS(led1), gpios)},
+	{ .name = DT_GPIO_LABEL(DT_ALIAS(led2), gpios),
+	  .pin = DT_GPIO_PIN(DT_ALIAS(led2), gpios),
+	  .flags = DT_GPIO_FLAGS(DT_ALIAS(led2), gpios)}
+};
+
+struct k_delayed_work led_timer;
+int show_sensors_data(k_timeout_t interval);
+void post_sensor_data( char * data);
+
+static size_t print_line(enum font_size font_size, int row, const char *text,
+			 size_t len, bool center)
+{	
+	uint8_t font_height, font_width;
+	uint8_t line[fonts[FONT_SMALL].columns + 1];
+	int pad;
+
+	cfb_framebuffer_set_font(epd_dev, font_size);
+
+	len = MIN(len, fonts[font_size].columns);
+	memcpy(line, text, len);
+	line[len] = '\0';
+
+	if (center) {
+		pad = (fonts[font_size].columns - len) / 2U;
+	} else {
+		pad = 0;
 	}
 
-	if (len >= CONFIG_BT_DEVICE_NAME_MAX) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	cfb_get_font_size(epd_dev, font_size, &font_width, &font_height);
+
+	if (cfb_print(epd_dev, line, font_width * pad, font_height * row)) {
+		printk("Failed to print a string\n");
 	}
-
-	memcpy(name, buf, len);
-	name[len] = '\0';
-
-	err = bt_set_name(name);
-	if (err) {
-		return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_RESOURCES);
-	}
-
-	board_refresh_display();
-
+	
 	return len;
 }
 
-static struct bt_uuid_128 name_uuid = BT_UUID_INIT_128(
-	0xf0, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
-	0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12);
+static size_t get_len(enum font_size font, const char *text)
+{	
+	const char *space = NULL;
+	size_t i;
 
-static struct bt_uuid_128 name_enc_uuid = BT_UUID_INIT_128(
-	0xf1, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
-	0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12);
+	for (i = 0; i <= fonts[font].columns; i++) {
+		switch (text[i]) {
+		case '\n':
+		case '\0':
+			return i;
+		case ' ':
+			space = &text[i];
+			break;
+		default:
+			continue;
+		}
+	}
 
-#define CPF_FORMAT_UTF8 0x19
+	/* If we got more characters than fits a line, and a space was
+	 * encountered, fall back to the last space.
+	 */
+	if (space) {
+		return space - text;
+	}
 
-static const struct bt_gatt_cpf name_cpf = {
-	.format = CPF_FORMAT_UTF8,
+	return fonts[font].columns;
+}
+
+void board_blink_leds(void)
+{	
+	status =1;
+	k_delayed_work_submit(&led_timer, K_MSEC(100));
+}
+
+int board_show_text(const char *text, bool center, k_timeout_t duration)
+{	
+	int i;
+
+	cfb_framebuffer_clear(epd_dev, false);
+	
+	for (i = 0; i < 3; i++) {
+		size_t len;
+
+		while (*text == ' ' || *text == '\n') {
+			text++;
+		}
+
+		len = get_len(FONT_BIG, text);
+		if (!len) {
+			break;
+		}
+
+		text += print_line(FONT_BIG, i, text, len, center);
+		if (!*text) {
+			break;
+		}
+	}
+
+	cfb_framebuffer_finalize(epd_dev);
+
+	if (!K_TIMEOUT_EQ(duration, K_FOREVER)) {
+		k_delayed_work_submit(&epd_work, duration);
+	}
+	return 0;
+}
+
+static struct stat {
+	uint16_t addr;
+	char name[9];
+	int8_t  rssi;
+	unsigned long d;
+	int temp1,temp2;
+	uint8_t min_hops;
+	uint8_t max_hops;
+	uint16_t hello_count;
+	uint16_t heartbeat_count;
+} stats[STAT_COUNT] = {
+	[0 ... (STAT_COUNT - 1)] = {
+		.min_hops = BT_MESH_TTL_MAX,
+		.max_hops = 0,
+	},
 };
 
-/* Vendor Primary Service Declaration */
-BT_GATT_SERVICE_DEFINE(name_svc,
-	/* Vendor Primary Service Declaration */
-	BT_GATT_PRIMARY_SERVICE(&name_uuid),
-	BT_GATT_CHARACTERISTIC(&name_enc_uuid.uuid,
-			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
-			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT,
-			       read_name, write_name, NULL),
-	BT_GATT_CUD("Badge Name", BT_GATT_PERM_READ),
-	BT_GATT_CPF(&name_cpf),
-);
+static uint32_t stat_count;
 
-static void passkey_display(struct bt_conn *conn, unsigned int passkey)
-{
-	char buf[20];
+#define NO_UPDATE -1
 
-	snprintk(buf, sizeof(buf), "Passkey:\n%06u", passkey);
+static int add_hello(uint16_t addr, int8_t  rssi,const char *name)
+{	
 
-	printk("%s\n", buf);
-	board_show_text(buf, false, K_SECONDS(20));
+
+	int i;
+	
+	for (i = 0; i < ARRAY_SIZE(stats); i++) {
+		struct stat *stat = &stats[i];
+
+		if (!stat->addr) {
+			stat->addr = addr;
+			stat->rssi=rssi;
+			strncpy(stat->name, name, sizeof(stat->name) - 1);
+			stat->hello_count = 1U;
+			stat_count++;
+			return i;
+		}
+
+		if (stat->addr == addr) {
+			/* Update name, incase it has changed */
+			strncpy(stat->name, name, sizeof(stat->name) - 1);
+
+			if (stat->hello_count < 0xffff) {
+				stat->rssi = rssi;
+				stat->hello_count++;
+				return i;
+			}
+
+			return NO_UPDATE;
+		}
+	}
+
+	return NO_UPDATE;
 }
 
-static void passkey_cancel(struct bt_conn *conn)
-{
-	printk("Cancel\n");
+static int add_heartbeat(uint16_t addr, uint8_t hops)
+{	
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(stats); i++) {
+		struct stat *stat = &stats[i];
+
+		if (!stat->addr) {
+			stat->addr = addr;
+			stat->heartbeat_count = 1U;
+			stat->min_hops = hops;
+			stat->max_hops = hops;
+			stat_count++;
+			return i;
+		}
+
+		if (stat->addr == addr) {
+			if (hops < stat->min_hops) {
+				stat->min_hops = hops;
+			} else if (hops > stat->max_hops) {
+				stat->max_hops = hops;
+			}
+
+			if (stat->heartbeat_count < 0xffff) {
+				stat->heartbeat_count++;
+				return i;
+			}
+
+			return NO_UPDATE;
+		}
+	}
+
+	return NO_UPDATE;
 }
 
-static void pairing_complete(struct bt_conn *conn, bool bonded)
-{
-	printk("Pairing Complete\n");
-	board_show_text("Pairing Complete", false, K_SECONDS(2));
-}
+void board_add_hello(uint16_t addr, int8_t  rssi,const char *name)
+{	
+	uint32_t sort_i;
 
-static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
-{
-	printk("Pairing Failed (%d)\n", reason);
-	board_show_text("Pairing Failed", false, K_SECONDS(2));
-}
-
-const struct bt_conn_auth_cb auth_cb = {
-	.passkey_display = passkey_display,
-	.cancel = passkey_cancel,
-	.pairing_complete = pairing_complete,
-	.pairing_failed = pairing_failed,
-};
-
-static void connected(struct bt_conn *conn, uint8_t err)
-{
-	printk("Connected (err 0x%02x)\n", err);
-
-	if (err) {
-		board_show_text("Connection failed", false, K_SECONDS(2));
-	} else {
-		board_show_text("Connected", false, K_FOREVER);
+	sort_i = add_hello(addr,rssi, name);
+	if (sort_i != NO_UPDATE) {
 	}
 }
 
-static void disconnected(struct bt_conn *conn, uint8_t reason)
-{
-	printk("Disconnected (reason 0x%02x)\n", reason);
+void board_add_heartbeat(uint16_t addr, uint8_t hops)
+{	
+	uint32_t sort_i;
 
-	if (strcmp(CONFIG_BT_DEVICE_NAME, bt_get_name()) &&
-	    !mesh_is_initialized()) {
-		/* Mesh will take over advertising control */
-		bt_le_adv_stop();
-		mesh_start();
-	} else {
-		board_show_text("Disconnected", false, K_SECONDS(2));
+	sort_i = add_heartbeat(addr, hops);
+	if (sort_i != NO_UPDATE) {
 	}
 }
 
-static struct bt_conn_cb conn_cb = {
-	.connected = connected,
-	.disconnected = disconnected,
-};
-
-static void bt_ready(int err)
+float_t distance(int8_t rssi)
 {
-	if (err) {
-		printk("Bluetooth init failed (err %d)\n", err);
+	float_t cal=0.0, temp=0.0;
+	
+	float p;
+	
+	cal = -69 -(rssi);
+	temp = cal/20;
+	p = (pow(10,temp)*100); 
+	return p;
+}
+void Display(k_timeout_t interval)
+{	
+	
+	int i;
+	struct stat *stat;
+	char str[100], str1[32];
+	
+	
+	/* Get the Board Address */
+	struct sensor_value val[3];
+	sprintf(str,"0x%04x", mesh_get_addr());
+	
+	
+	
+	/* hdc1010 get Temperature and Humidity */
+	if (get_hdc1010_val(val)) {
+		goto _error_get;
+	}
+	sprintf(str1,",%d", val[0].val1 );
+	strcat(str, str1);
+	
+	sprintf(str1,".%d", val[0].val2 / 100000 );
+	strcat(str, str1);
+	
+	
+	sprintf(str1,",%d", val[1].val1);
+	strcat(str, str1);
+	
+	
+	sprintf(str1,",%u", stat_count );
+	strcat(str, str1);
+	
+	/* Get the Information of the neighbour node : Address, Disance */
+	if (stat_count > 0) {
+		
+		for (i = 0; i < ARRAY_SIZE(stats); i++) {
+		
+		stat = &stats[i];
+		if (!stat->addr) {
+			break;
+		}
+
+		if (!stat->hello_count) {
+			continue;
+		}
+
+		stat = &stats[i];
+			
+		stat->d = distance(stat->rssi);
+			
+		sprintf(str1,",0x%04x", stat->addr);
+		strcat(str, str1);
+			
+		sprintf(str1,",%ld", stat->d/100);
+		strcat(str, str1);
+			
+			
+		}
+	}
+
+	
+	k_delayed_work_submit(&epd_work, interval);
+	post_sensor_data(str);					// Calling Function post_sensor_data
+	return;
+_error_get:
+	printk("Failed to get sensor data or print a string\n");
+}
+
+void post_sensor_data( char * data)
+{
+ printk("Posting Data : %s\n", data);
+
+}
+
+/* To display the statistic on the Board */
+static void show_statistics(k_timeout_t interval)
+{	
+	
+	int len, i, line = 0;
+	struct stat *stat;
+	char str[32];
+	int val;
+	
+	cfb_framebuffer_clear(epd_dev, false);
+	/* Current Node Address */
+	len = snprintk(str, sizeof(str),
+		       "Own Address: 0x%04x", mesh_get_addr());
+	print_line(FONT_SMALL, line++, str, len, false);
+	
+	/* Total Number of Nodes present in the mesh network*/
+	len = snprintk(str, sizeof(str),
+		       "Node Count:  %u", stat_count + 1);
+	print_line(FONT_SMALL, line++, str, len, false);
+	
+	/* Display the Proximity sensor Value*/
+	val=show_sensors_data(K_SECONDS(2));
+	printk("Proximity:%d\n", val);
+	len = snprintf(str_buf, sizeof(str_buf), "Proximity:%d\n", val);
+	print_line(FONT_SMALL, line++, str_buf, len, false);
+	
+	/* If Neighbour node present display the detail : Message_Count, Address, RSSI, Distance(cm) */
+	if (stat_count > 0) {
+		len = snprintk(str, sizeof(str), "Msg,NodeId,rssi,d(cm)");
+		print_line(FONT_SMALL, line++, str, len, false);
+
+		for (i = 0; i < ARRAY_SIZE(stats); i++) {
+		
+		stat = &stats[i];
+		if (!stat->addr) {
+			break;
+		}
+
+		if (!stat->hello_count) {
+			continue;
+		}
+
+			stat = &stats[i];
+			
+			stat->d = distance(stat->rssi);
+
+
+			len = snprintk(str, sizeof(str), "%-3u 0x%04x %d  %lu",
+				       stat->hello_count, stat->addr,stat->rssi,stat->d);
+			print_line(FONT_SMALL, line++, str, len, false);
+		}
+	}
+
+	cfb_framebuffer_finalize(epd_dev);
+	k_delayed_work_submit(&epd_work, interval);
+}
+
+/* To Alert the user using red led if distance < 2 meters*/
+static void show_display(k_timeout_t interval)
+{	
+	
+	int len, i, line = 0;
+	struct stat *stat;
+	char str[32];
+	int count = 0;
+	cfb_framebuffer_clear(epd_dev, false);
+
+	/* Display node ID : */
+	len = snprintk(str, sizeof(str),"My ID: 0x%04x", mesh_get_addr());
+	print_line(FONT_SMALL, line++, str, len, false);
+	
+	if(status)
+	{
+	cfb_print(epd_dev,"Recieving...",150,0);                        // Blinks if neighbour input is recieved 
+	status =0;
+	}
+	cfb_print(epd_dev, "--------------------",0,16);
+	
+	cfb_framebuffer_set_font(epd_dev,0);
+	cfb_print(epd_dev,"*",0,32);
+	
+
+	for (i = 0; i < ARRAY_SIZE(stats); i++) {
+		
+
+		stat = &stats[i];
+		if (!stat->addr) {
+			break;
+		}
+
+		if (!stat->hello_count) {
+			continue;
+		}
+		stat->d = distance(stat->rssi);
+		if(stat->d < 200)				// if distance < 2 meter alert RED
+		{	
+			cfb_print(epd_dev,"+",32,32);
+			getled();
+		}
+		else	
+			//sprintf (str,"%x",stat->addr);
+			cfb_print(epd_dev,"#", 150, 32);
+
+		
+	}
+	cfb_framebuffer_set_font(epd_dev,0);
+	cfb_print(epd_dev, "--------------------",0,48);
+	
+	for (i = 0; i < ARRAY_SIZE(stats); i++) {
+		
+		stat = &stats[i];
+		if (!stat->addr) {
+			break;
+		}
+
+		if (!stat->hello_count) {
+			continue;
+		}
+		stat->d = distance(stat->rssi);
+		if(stat->d < 200 )
+		 { 
+		   count++;
+		   sprintf (str,"0x%x",stat->addr);
+		   cfb_print(epd_dev,str,0,80+(16*i));
+		 }
+	}
+	
+	line=4;
+	len = snprintk(str, sizeof(str),
+		       "No. of devices near: %d", count);
+	print_line(FONT_SMALL, line++, str, len, false);
+	
+	
+	cfb_framebuffer_finalize(epd_dev);
+	k_delayed_work_submit(&epd_work, interval);
+}
+
+/* Get Proximity Data */
+int show_sensors_data(k_timeout_t interval)
+{	
+	struct sensor_value val[3];
+	
+	/* apds9960 */
+	if (get_apds9960_val(val)) {
+		goto _error_get;
+	}
+
+	k_delayed_work_submit(&epd_work, interval);
+
+	return val[1].val1;
+_error_get:
+	printk("Failed to get sensor data or print a string\n");
+}
+
+
+static void show_main(void)
+{	
+	char buf[CONFIG_BT_DEVICE_NAME_MAX];
+	int i;
+
+	strncpy(buf, bt_get_name(), sizeof(buf) - 1);
+	buf[sizeof(buf) - 1] = '\0';
+
+	/* Convert commas to newlines */
+	for (i = 0; buf[i] != '\0'; i++) {
+		if (buf[i] == ',') {
+			buf[i] = '\n';
+		}
+	}
+	
+	board_show_text(buf, true, K_FOREVER);
+	
+}
+
+static void epd_update(struct k_work *work)
+{	
+	switch (screen_id) {
+	case SCREEN_DIS:
+		show_display( K_SECONDS(1));
+		return;
+	case SCREEN_STATS:
+		show_statistics( K_SECONDS(2));
+		return;
+	case SCREEN_MAIN:	
+		show_main();
+		//Display(K_SECONDS(2));
+		return;
+	}
+}
+
+static void long_press(struct k_work *work)
+{	
+	/* Treat as release so actual release doesn't send messages */
+	pressed = false;
+	screen_id = (screen_id + 1) % SCREEN_LAST;
+	printk("Change screen to id = %d\n", screen_id);
+	board_refresh_display();
+}
+
+static bool button_is_pressed(void)
+{	
+	return gpio_pin_get(gpio, DT_GPIO_PIN(DT_ALIAS(sw0), gpios)) > 0;
+}
+
+static void button_interrupt(const struct device *dev,
+			     struct gpio_callback *cb,
+			     uint32_t pins)
+{	
+	if (button_is_pressed() == pressed) {
 		return;
 	}
 
-	printk("Bluetooth initialized\n");
+	pressed = !pressed;
+	printk("Button %s\n", pressed ? "pressed" : "released");
 
-	err = mesh_init();
-	if (err) {
-		printk("Initializing mesh failed (err %d)\n", err);
+	if (pressed) {
+		k_delayed_work_submit(&long_press_work, LONG_PRESS_TIMEOUT);
 		return;
 	}
 
-	printk("Mesh initialized\n");
-
-	bt_conn_cb_register(&conn_cb);
-	bt_conn_auth_cb_register(&auth_cb);
-
-	if (IS_ENABLED(CONFIG_SETTINGS)) {
-		settings_load();
-	}
+	k_delayed_work_cancel(&long_press_work);
 
 	if (!mesh_is_initialized()) {
-		/* Start advertising */
-		err = bt_le_adv_start(BT_LE_ADV_CONN_NAME,
-				      ad, ARRAY_SIZE(ad), NULL, 0);
-		if (err) {
-			printk("Advertising failed to start (err %d)\n", err);
-			return;
-		}
-	} else {
-		printk("Already provisioned\n");
+		return;
 	}
 
-	board_refresh_display();
+	/* Short press for views */
+	switch (screen_id) {
+	case SCREEN_DIS:
+	case SCREEN_STATS:
+		return;
+	case SCREEN_MAIN:
+		if (pins & BIT(DT_GPIO_PIN(DT_ALIAS(sw0), gpios))) {
+			uint32_t uptime = k_uptime_get_32();
+			static uint32_t bad_count, press_ts;
 
-	printk("Board started\n");
+			if (uptime - press_ts < 500) {
+				bad_count++;
+			} else {
+				bad_count = 0U;
+			}
+
+			press_ts = uptime;
+
+			if (bad_count) {
+				if (bad_count > 5) {
+					mesh_send_baduser();
+					bad_count = 0U;
+				} else {
+					printk("Ignoring press\n");
+				}
+			} else {
+				mesh_send_hello();
+			}
+		}
+		return;
+	default:
+		return;
+	}
 }
 
-void main(void)
-{
-	initialize_dhcp();
+static int configure_button(void)						
+{	
+	static struct gpio_callback button_cb;
 
-	int err;
-	err = board_init();
-	if (err) {
-		printk("board init failed (err %d)\n", err);
+	gpio = device_get_binding(DT_GPIO_LABEL(DT_ALIAS(sw0), gpios));
+	if (!gpio) {
+		return -ENODEV;
+	}
+
+	gpio_pin_configure(gpio, DT_GPIO_PIN(DT_ALIAS(sw0), gpios),
+			   GPIO_INPUT | DT_GPIO_FLAGS(DT_ALIAS(sw0), gpios));
+
+	gpio_pin_interrupt_configure(gpio, DT_GPIO_PIN(DT_ALIAS(sw0), gpios),
+				     GPIO_INT_EDGE_BOTH);
+
+	gpio_init_callback(&button_cb, button_interrupt,
+			   BIT(DT_GPIO_PIN(DT_ALIAS(sw0), gpios)));
+
+	gpio_add_callback(gpio, &button_cb);
+
+	return 0;
+}
+
+int set_led_state(uint8_t id, bool state)
+{	
+	return gpio_pin_set(leds[id].dev, leds[id].pin, state);
+}
+
+static void led_timeout(struct k_work *work)
+{	
+	static int led_cntr;
+	int i;
+
+	/* Disable all LEDs */
+	for (i = 0; i < ARRAY_SIZE(leds); i++) {
+		set_led_state(i, 0);
+	}
+
+	/* Stop after 5 iterations */
+	if (led_cntr >= (ARRAY_SIZE(leds) * 5)) {
+		led_cntr = 0;
 		return;
 	}
 
-	printk("Starting Board Demo\n");
+	/* Select and enable current LED */
+	i = led_cntr++ % ARRAY_SIZE(leds);
+	set_led_state(i, 1);
 
-	/* Initialize the Bluetooth Subsystem */
-	err = bt_enable(bt_ready);
-	if (err) {
-		printk("Bluetooth init failed (err %d)\n", err);
-		return;
+	k_delayed_work_submit(&led_timer, K_MSEC(100));
+}
+
+static int configure_leds(void)
+{	
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(leds); i++) {
+		leds[i].dev = device_get_binding(leds[i].name);
+		if (!leds[i].dev) {
+			printk("Failed to get %s device\n", leds[i].name);
+			return -ENODEV;
+		}
+
+		gpio_pin_configure(leds[i].dev, leds[i].pin,
+				   leds[i].flags |
+				   GPIO_OUTPUT_INACTIVE);
 	}
 
-	err = periphs_init();
-	if (err) {
-		printk("perpherals initialization failed (err %d)\n", err);
-		return;
+	k_delayed_work_init(&led_timer, led_timeout);
+	return 0;
+}
+
+static int erase_storage(void)
+{	
+	const struct device *dev;
+
+	dev = device_get_binding(DT_CHOSEN_ZEPHYR_FLASH_CONTROLLER_LABEL);
+
+	return flash_erase(dev, FLASH_AREA_OFFSET(storage),
+			   FLASH_AREA_SIZE(storage));
+}
+
+void board_refresh_display(void)
+{	
+	k_delayed_work_submit(&epd_work, K_NO_WAIT);
+}
+
+int board_init(void)						//2
+{	
+	epd_dev = device_get_binding(DT_LABEL(DT_INST(0, solomon_ssd16xxfb)));
+	if (epd_dev == NULL) {
+		printk("SSD16XX device not found\n");
+		return -ENODEV;
 	}
+
+	if (cfb_framebuffer_init(epd_dev)) {
+		printk("Framebuffer initialization failed\n");
+		return -EIO;
+	}
+
+	cfb_framebuffer_clear(epd_dev, true);
+
+	if (configure_button()) {
+		printk("Failed to configure button\n");
+		return -EIO;
+	}
+
+	if (configure_leds()) {
+		printk("LED init failed\n");
+		return -EIO;
+	}
+
+	k_delayed_work_init(&epd_work, epd_update);
+	k_delayed_work_init(&long_press_work, long_press);
+
+	pressed = button_is_pressed();
+	if (pressed) {
+		printk("Erasing storage\n");
+		board_show_text("Resetting Device", false, K_SECONDS(1));
+		erase_storage();
+	}
+
+	return 0;
 }
