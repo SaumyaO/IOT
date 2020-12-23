@@ -22,7 +22,7 @@ On your phone, use the nRFConnect app to Scan for devices and look for "reel boa
 
 #. Click on Generic Access on the phone 
 
-#. Click Device Name( Charateristic UserNAme) and click the upward arrow( write command to peripheral device ie.e reel board), to initiate the authentication process
+#. Click Device Name( Charateristic UserName) and click the upward arrow( write command to peripheral device ie.e reel board), to initiate the authentication process
    if wanted to change the device name, Enter the name ( optional)
 
 #. Once the name is comfirm click send.
